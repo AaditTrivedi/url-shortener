@@ -2,7 +2,8 @@
 Distributed URL Shortener Service
 ==================================
 A scalable URL shortener built with FastAPI, PostgreSQL, and Redis.
-Features consistent hashing, caching, rate limiting, and structured error handling.
+Features consistent hashing, caching with circuit breaker, rate limiting,
+and structured error handling.
 """
 
 import hashlib
@@ -10,6 +11,7 @@ import os
 import time
 import string
 import random
+import logging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -21,6 +23,12 @@ import asyncpg
 import redis.asyncio as aioredis
 
 
+# ─── Logging ─────────────────────────────────────────────────────────────────
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("url-shortener")
+
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shortener:shortener@localhost:5432/shortener")
@@ -30,6 +38,11 @@ SHORT_CODE_LENGTH = 7
 RATE_LIMIT_MAX_REQUESTS = 60
 RATE_LIMIT_WINDOW_SECONDS = 60
 CACHE_TTL_SECONDS = 3600
+
+# Circuit breaker settings
+REDIS_TIMEOUT_SECONDS = 1          # Fast timeout — don't block on Redis failures
+CIRCUIT_BREAKER_THRESHOLD = 3      # Open circuit after 3 consecutive failures
+CIRCUIT_BREAKER_RESET_SECONDS = 30 # Try Redis again after 30 seconds
 
 
 # ─── Models ──────────────────────────────────────────────────────────────────
@@ -58,13 +71,69 @@ class HealthResponse(BaseModel):
     status: str
     database: str
     cache: str
+    circuit_breaker: str
     timestamp: str
+
+
+# ─── Circuit Breaker ─────────────────────────────────────────────────────────
+
+class RedisCircuitBreaker:
+    """
+    Circuit breaker for Redis operations.
+
+    After CIRCUIT_BREAKER_THRESHOLD consecutive failures, the circuit opens
+    and all Redis operations are skipped (returning None) for
+    CIRCUIT_BREAKER_RESET_SECONDS. After that, a single probe request is
+    allowed through. If it succeeds, the circuit closes. If it fails,
+    the circuit stays open for another reset period.
+    """
+
+    def __init__(self, threshold: int = 3, reset_seconds: int = 30):
+        self.threshold = threshold
+        self.reset_seconds = reset_seconds
+        self.failure_count = 0
+        self.last_failure_time: float = 0
+        self.state = "closed"  # closed, open, half-open
+
+    def record_success(self):
+        self.failure_count = 0
+        if self.state != "closed":
+            logger.info("Circuit breaker CLOSED — Redis is back")
+        self.state = "closed"
+
+    def record_failure(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.threshold:
+            if self.state != "open":
+                logger.warning(
+                    f"Circuit breaker OPEN — Redis failed {self.failure_count} times consecutively. "
+                    f"Falling back to PostgreSQL-only mode for {self.reset_seconds}s."
+                )
+            self.state = "open"
+
+    def should_allow_request(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            elapsed = time.time() - self.last_failure_time
+            if elapsed >= self.reset_seconds:
+                self.state = "half-open"
+                logger.info("Circuit breaker HALF-OPEN — probing Redis")
+                return True
+            return False
+        # half-open: allow one request through
+        return True
 
 
 # ─── Database ────────────────────────────────────────────────────────────────
 
 db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[aioredis.Redis] = None
+circuit_breaker = RedisCircuitBreaker(
+    threshold=CIRCUIT_BREAKER_THRESHOLD,
+    reset_seconds=CIRCUIT_BREAKER_RESET_SECONDS
+)
 
 
 async def init_db():
@@ -86,7 +155,13 @@ async def init_db():
 
 async def init_redis():
     global redis_client
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    redis_client = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_timeout=REDIS_TIMEOUT_SECONDS,       # 1 second timeout
+        socket_connect_timeout=REDIS_TIMEOUT_SECONDS, # 1 second connect timeout
+        retry_on_timeout=False                        # Don't retry — fail fast
+    )
 
 
 async def close_db():
@@ -95,6 +170,52 @@ async def close_db():
     if redis_client:
         await redis_client.close()
 
+
+# ─── Safe Redis Operations ───────────────────────────────────────────────────
+
+async def safe_redis_get(key: str) -> Optional[str]:
+    """Get from Redis with circuit breaker protection."""
+    if not redis_client or not circuit_breaker.should_allow_request():
+        return None
+    try:
+        result = await redis_client.get(key)
+        circuit_breaker.record_success()
+        return result
+    except Exception as e:
+        circuit_breaker.record_failure()
+        logger.debug(f"Redis GET failed for '{key}': {e}")
+        return None
+
+
+async def safe_redis_setex(key: str, ttl: int, value: str) -> bool:
+    """Set in Redis with circuit breaker protection."""
+    if not redis_client or not circuit_breaker.should_allow_request():
+        return False
+    try:
+        await redis_client.setex(key, ttl, value)
+        circuit_breaker.record_success()
+        return True
+    except Exception as e:
+        circuit_breaker.record_failure()
+        logger.debug(f"Redis SETEX failed for '{key}': {e}")
+        return False
+
+
+async def safe_redis_delete(key: str) -> bool:
+    """Delete from Redis with circuit breaker protection."""
+    if not redis_client or not circuit_breaker.should_allow_request():
+        return False
+    try:
+        await redis_client.delete(key)
+        circuit_breaker.record_success()
+        return True
+    except Exception as e:
+        circuit_breaker.record_failure()
+        logger.debug(f"Redis DELETE failed for '{key}': {e}")
+        return False
+
+
+# ─── Application Lifecycle ───────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -106,8 +227,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="URL Shortener",
-    description="A scalable URL shortener with Redis caching, rate limiting, and PostgreSQL persistence.",
-    version="1.0.0",
+    description=(
+        "A scalable URL shortener with Redis caching (circuit breaker protected), "
+        "rate limiting, and PostgreSQL persistence."
+    ),
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -115,7 +239,7 @@ app = FastAPI(
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def generate_short_code(url: str) -> str:
-    """Generate a short code using consistent hashing (SHA-256 + base62 encoding)."""
+    """Generate a short code using consistent hashing (SHA-256 + base62)."""
     salt = "".join(random.choices(string.ascii_letters + string.digits, k=8))
     hash_input = f"{url}{salt}{time.time_ns()}"
     hash_digest = hashlib.sha256(hash_input.encode()).hexdigest()
@@ -129,44 +253,65 @@ def generate_short_code(url: str) -> str:
 
 
 async def rate_limit(request: Request):
-    """Rate limiting using Redis sliding window counter."""
-    if not redis_client:
-        return
+    """Rate limiting using Redis with circuit breaker fallback."""
+    if not redis_client or not circuit_breaker.should_allow_request():
+        return  # If Redis is down, skip rate limiting (graceful degradation)
+
     client_ip = request.client.host if request.client else "unknown"
     key = f"rate_limit:{client_ip}"
-    current = await redis_client.get(key)
-    if current and int(current) >= RATE_LIMIT_MAX_REQUESTS:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded. Max {RATE_LIMIT_MAX_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS}s."
-        )
-    pipe = redis_client.pipeline()
-    pipe.incr(key)
-    pipe.expire(key, RATE_LIMIT_WINDOW_SECONDS)
-    await pipe.execute()
+
+    try:
+        current = await redis_client.get(key)
+        if current and int(current) >= RATE_LIMIT_MAX_REQUESTS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded. Max {RATE_LIMIT_MAX_REQUESTS} requests per {RATE_LIMIT_WINDOW_SECONDS}s."
+            )
+        pipe = redis_client.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+        await pipe.execute()
+        circuit_breaker.record_success()
+    except HTTPException:
+        raise
+    except Exception:
+        circuit_breaker.record_failure()
+        # Rate limiting unavailable — allow the request through
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """Check service, database, and cache health."""
+    """Check service health including circuit breaker state."""
     db_status = "unhealthy"
     cache_status = "unhealthy"
+
     try:
         async with db_pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
         db_status = "healthy"
     except Exception:
         pass
+
     try:
-        await redis_client.ping()
-        cache_status = "healthy"
+        if circuit_breaker.should_allow_request():
+            await redis_client.ping()
+            cache_status = "healthy"
+            circuit_breaker.record_success()
+        else:
+            cache_status = "bypassed (circuit open)"
     except Exception:
-        pass
-    status = "healthy" if db_status == "healthy" and cache_status == "healthy" else "degraded"
+        circuit_breaker.record_failure()
+        cache_status = "unhealthy"
+
+    status = "healthy" if db_status == "healthy" else "degraded"
+
     return HealthResponse(
-        status=status, database=db_status, cache=cache_status,
+        status=status,
+        database=db_status,
+        cache=cache_status,
+        circuit_breaker=circuit_breaker.state,
         timestamp=datetime.now(timezone.utc).isoformat()
     )
 
@@ -204,10 +349,8 @@ async def create_short_url(payload: URLCreateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    try:
-        await redis_client.setex(f"url:{short_code}", CACHE_TTL_SECONDS, original_url)
-    except Exception:
-        pass
+    # Cache in Redis (non-blocking, circuit breaker protected)
+    await safe_redis_setex(f"url:{short_code}", CACHE_TTL_SECONDS, original_url)
 
     return URLCreateResponse(
         short_code=row["short_code"], short_url=f"{BASE_URL}/{row['short_code']}",
@@ -217,19 +360,21 @@ async def create_short_url(payload: URLCreateRequest):
 
 @app.get("/{short_code}", tags=["URLs"], dependencies=[Depends(rate_limit)])
 async def redirect_to_url(short_code: str):
-    """Redirect short code to original URL. Cache-first with DB fallback."""
-    # Try cache first
-    try:
-        cached_url = await redis_client.get(f"url:{short_code}")
-        if cached_url:
+    """Redirect short code to original URL. Cache-first with circuit breaker fallback to DB."""
+
+    # Try cache first (circuit breaker protected)
+    cached_url = await safe_redis_get(f"url:{short_code}")
+    if cached_url:
+        # Update click count in DB
+        try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE urls SET click_count = click_count + 1, last_accessed = NOW() WHERE short_code = $1",
                     short_code
                 )
-            return RedirectResponse(url=cached_url, status_code=307)
-    except Exception:
-        pass
+        except Exception:
+            pass  # Click tracking is non-critical
+        return RedirectResponse(url=cached_url, status_code=307)
 
     # Fallback to database
     try:
@@ -245,10 +390,8 @@ async def redirect_to_url(short_code: str):
     if not row:
         raise HTTPException(status_code=404, detail=f"Short code '{short_code}' not found.")
 
-    try:
-        await redis_client.setex(f"url:{short_code}", CACHE_TTL_SECONDS, row["original_url"])
-    except Exception:
-        pass
+    # Cache for future requests (non-blocking, circuit breaker protected)
+    await safe_redis_setex(f"url:{short_code}", CACHE_TTL_SECONDS, row["original_url"])
 
     return RedirectResponse(url=row["original_url"], status_code=307)
 
@@ -286,10 +429,8 @@ async def delete_url(short_code: str):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail=f"Short code '{short_code}' not found.")
-    try:
-        await redis_client.delete(f"url:{short_code}")
-    except Exception:
-        pass
+
+    await safe_redis_delete(f"url:{short_code}")
 
 
 # ─── Error Handlers ──────────────────────────────────────────────────────────
